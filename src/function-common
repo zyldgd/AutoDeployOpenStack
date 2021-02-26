@@ -1,0 +1,1176 @@
+#!/bin/bash
+# @author: zyl
+# @date: 2019-8-14
+# @email: zhaoyulai@inspur.com
+# @description：common functions declared and defined here
+# @OpenStack version: Rocky
+# @OS: Ubuntu 18.4 server
+
+SRC_PATH="${WORK_PATH}/src"
+CONF_PATH="${WORK_PATH}/stack.conf"
+LOG_PATH="/var/log/auto-deploy-openstack.log"
+
+LOCAL_HOST=$(hostname)
+LOCAL_IPv4=$(ifconfig -a | grep inet | grep -v 127.0.0.1 | grep -v inet6 | awk '{print $2}' | tr -d "addr:")
+LOCAL_IPv4=(${LOCAL_IPv4//\n/ })
+LOCAL_IPv4=${LOCAL_IPv4[0]}
+
+INFO="INFO  "
+WARN="WARNING  "
+ERRO="ERROR  "
+
+APT_UPDATED=${APT_UPDATED:-False}
+INITED=${INITED:-False}
+
+MYSQL_USER=${MYSQL_USER:-root}
+MYSQL_PASS=${MYSQL_PASS:-root}
+#################### function region ######################
+# @use: LOG options [show] [string]
+#           options:
+#               -info
+#               -warning
+#               -error
+#           show:
+#               -s   print log on screen
+# @description: log or print the infomation on the screen
+# @pass-test
+function LOG() {
+    local prefixion=""
+
+    if [ ${1} == "-info" ]; then
+        prefixion+="${INFO}"
+    elif [ ${1} == "-warning" ]; then
+        prefixion+="${WARN}"
+    elif [ ${1} == "-error" ]; then
+        prefixion+="${ERRO}"
+    fi
+
+    if [ ${2} == "-s" ]; then
+        echo "${prefixion}"${3}
+        echo "${prefixion}"${3} >> ${LOG_PATH} 2>&1
+    else
+        echo "${prefixion}"${2} >> ${LOG_PATH} 2>&1
+    fi
+}
+
+# @use: option hint-string
+# @description: choice YES or NO
+# @return:
+#       1 => yes
+#       2 => no
+function option() {
+    while [ true ]; do
+        read -p "${1}" choice
+        case $choice in
+        Y | y | yes | YES)
+            return 1
+            break
+            ;;
+        N | n | no | NO)
+            return 2
+            ;;
+        .*)
+            continue
+            ;;
+        esac
+        echo "Enter Y(y) or N(n)."
+    done
+}
+
+# @use: reCode command-string
+# @description: get the result from previous CLI
+# @pass-test
+function reCode() {
+    if [ $? == 0 ]; then
+        LOG -info -s "${1} succeed!"
+    else
+        LOG -warning -s "${1} fail!"
+    fi
+}
+
+# @use: aptUpdate
+function aptUpdate() {
+    if [ $APT_UPDATED == "True" ]; then
+        LOG -info -s "apt-get updated"
+        return 0
+    fi
+
+    if ! timeout 600 sh -c "apt-get update"; then
+        LOG -error -s "apt-get update timeout!!!"
+        return 1
+    fi
+    LOG -info -s "apt-get update finished"
+    APT_UPDATED=True
+    return 0
+}
+
+# @warning: function checkPackage_old has been deprecated !!!
+# @see: function packagesInstall
+# @use: packagesInstall command-string package-names...
+# @use: packagesInstall command-string
+# @description: check if packages exist? if no then install them
+function checkPackage_old() {
+    local arg=$*
+    local arg1=${1}
+    local arg1n=${#arg1}
+    local com=${arg:arg1n}
+    local packageNames=${1}
+
+    if (($# >= 1)); then
+        packageNames=$com
+    fi
+
+    ${1} >/dev/null 2>&1
+
+    # if no packages
+    if (($? == 127)); then
+        LOG -warning -s "command ${1} not found, ${packageNames} will be installed"
+        for packageName in ${packageNames}; do
+            LOG -info -s "installing ${packageName}, Please wait in patient!"
+            echo "y" | apt-get install ${packageName} # >>${LOG_PATH} 2>&1
+            reCode "apt-get install ${packageName}"
+        done
+        return 1
+    fi
+    LOG -info -s "package [${packageNames}] exist!"
+    return 0
+}
+
+# @use: packagesInstall package-names...
+# @description: check if packages exist? if no then install them
+# @pass-test
+function packagesInstall() {
+    for packageName in $*; do
+        # count the package
+        # local count=$(dpkg -l | grep -i ${packageName} | wc -l)
+        # the package exist
+        if dpkg -s ${packageName} >/dev/null 2>&1; then
+            LOG -info -s "package ${packageName} exist!"
+        else
+            LOG -warning -s "package ${packageName} not found!"
+            LOG -info -s "installing ${packageName}, Please wait in patient!"
+            echo "y" | apt-get install ${packageName} || (reCode "apt-get install ${packageName}" && return 1)
+            reCode "apt-get install ${packageName}"
+        fi
+    done
+    return 0
+}
+
+# @use: setConf <file-path> <session> <key> <value>
+#       <session>
+#       <key> = <value>
+# @description: set <session> <key> <value> at <file-path>
+# @pass-test
+function setConf() {
+    crudini --set ${1} ${2} ${3} ${4}
+}
+
+# @use: setConf <file-path> <section> <key>
+# @description: get the value of <section>'s<key> at <file-path>
+# @return: <value>
+function getConf() {
+    local getConfvalue=$(crudini --get ${1} ${2} ${3})
+    echo $getConfvalue || echo null
+}
+
+# @use: delConf <file-path> <session> <key>
+# @description: del <session> <key>
+# @pass-test
+function delConf() {
+    if (($# == 2)); then
+        crudini --del ${1} ${2}
+    elif (($# == 3)); then
+        crudini --del ${1} ${2} ${3}
+    fi
+}
+
+# @use: initScript
+# @description: initialize it
+function initScript() {
+    if [ $INITED == 'False' ]; then
+        packagesInstall "crudini" 
+        if (($? == 1)); then
+            LOG -error -s "crudini install failed! please update your apt source.list"
+            option "${INFO}modify the installation source? (mirrors.aliyun.com) [yes/no]:"
+            if (($? == 1)); then
+                modifyInstallationSource
+            fi
+        fi
+        INITED='True'
+    fi
+    
+    local projectDomainName=$(getConf ${CONF_PATH} domain project_domain_name)
+    local userDomainName=$(getConf ${CONF_PATH} domain user_domain_name)
+    local keystoneHostIp=$(getConf ${CONF_PATH} keystone host_ip)
+
+    local adminOpenrcPath="/root/admin-openrc"
+    echo "" >${adminOpenrcPath}
+    echo "export OS_PROJECT_DOMAIN_NAME=${projectDomainName}" >>${adminOpenrcPath}
+    echo "export OS_USER_DOMAIN_NAME=${userDomainName}" >>${adminOpenrcPath}
+    echo "export OS_PROJECT_NAME=admin" >>${adminOpenrcPath}
+    echo "export OS_USERNAME=admin" >>${adminOpenrcPath}
+    echo "export OS_PASSWORD=admin" >>${adminOpenrcPath}
+    echo "export OS_AUTH_URL=http://${keystoneHostIp}:5000/v3" >>${adminOpenrcPath}
+    echo "export OS_IDENTITY_API_VERSION=3" >>${adminOpenrcPath}
+    echo "export OS_IMAGE_API_VERSION=2" >>${adminOpenrcPath}
+    sleep 1
+    source /root/admin-openrc
+    LOG -info -s "source /root/admin-openrc"
+    LOG -info -s "logs located at ${LOG_PATH}"
+    LOG -info -s "conf located at ${CONF_PATH}"
+    LOG -info -s "get Keystone-Host-IP:${keystoneHostIp}"
+    LOG -info -s "================ Start ================"
+    
+    MYSQL_USER=$(getConf ${CONF_PATH} mysql user)
+    MYSQL_PASS=$(getConf ${CONF_PATH} mysql password)
+}
+
+# @use: modifyInstallationSource
+# @description: replace the installation source with (mirrors.aliyun.com)
+function modifyInstallationSource() {
+    local sourcesPath="/etc/apt/sources.list"
+    mv ${sourcesPath} ${sourcesPath}.bak
+    LOG -info -s "sources.list.bak has been created"
+    echo "deb http://mirrors.aliyun.com/ubuntu/ bionic main restricted universe multiverse" >>${sourcesPath}
+    echo "deb-src http://mirrors.aliyun.com/ubuntu/ bionic main restricted universe multiverse" >>${sourcesPath}
+    echo "deb http://mirrors.aliyun.com/ubuntu/ bionic-security main restricted universe multiverse" >>${sourcesPath}
+    echo "deb-src http://mirrors.aliyun.com/ubuntu/ bionic-security main restricted universe multiverse" >>${sourcesPath}
+    echo "deb http://mirrors.aliyun.com/ubuntu/ bionic-updates main restricted universe multiverse" >>${sourcesPath}
+    echo "deb-src http://mirrors.aliyun.com/ubuntu/ bionic-updates main restricted universe multiverse" >>${sourcesPath}
+    echo "deb http://mirrors.aliyun.com/ubuntu/ bionic-backports main restricted universe multiverse" >>${sourcesPath}
+    echo "deb-src http://mirrors.aliyun.com/ubuntu/ bionic-backports main restricted universe multiverse" >>${sourcesPath}
+    echo "deb http://mirrors.aliyun.com/ubuntu/ bionic-proposed main restricted universe multiverse" >>${sourcesPath}
+    echo "deb-src http://mirrors.aliyun.com/ubuntu/ bionic-proposed main restricted universe multiverse " >>${sourcesPath}
+    # cat LOG | awk 'END {print}'
+
+    LOG -info -s "sources.list has been modified"
+    LOG -info -s "It may take a loooooooong time to update and upgrade the apt..."
+    
+    option "${INFO}update your apt [yes/no]:"
+    if (($? == 1)); then
+        aptUpdate
+    fi
+
+    # apt-get update # >>${LOG_PATH} 2>&1
+    # LOG -info -s "apt-get update"
+    # apt-get dist-upgrade # >>${LOG_PATH} 2>&1
+    # LOG -info -s "apt-get dist-upgrade"
+    #LOG -info -s "skip modify the installation source"
+}
+
+# @use: excuteSQL <SQL>
+function excuteSQL() {
+    if (($# == 1)); then
+        # #mysql -h${MYSQL_IP_HOST} -u${MYSQL_USER} -p${MYSQL_PASS} -e${*}
+        mysql -u${MYSQL_USER} -p${MYSQL_PASS} -e"${*}"
+        LOG -info -s "${*}"
+    fi
+}
+
+# @use: installMysql
+# @ref-url: https://docs.openstack.org/install-guide/environment-sql-database-ubuntu.html
+function installMysql() {
+    packagesInstall "mariadb-server" "python-pymysql"
+
+    local mysqlUser=$(getConf ${CONF_PATH} mysql user)
+    local mysqlPass=$(getConf ${CONF_PATH} mysql password)
+    local mysqlHostIp=$(getConf ${CONF_PATH} mysql host_ip)
+    local mysqlConfPath="/etc/mysql/mariadb.conf.d/99-openstack.cnf"
+
+    setConf ${mysqlConfPath} mysqld bind-address ${mysqlHostIp}
+    setConf ${mysqlConfPath} mysqld default-storage-engine innodb
+    setConf ${mysqlConfPath} mysqld innodb_file_per_table on
+    setConf ${mysqlConfPath} mysqld max_connections 4096
+    setConf ${mysqlConfPath} mysqld collation-server utf8_general_ci
+    setConf ${mysqlConfPath} mysqld character-set-server utf8
+    LOG -info -s "mysql has been configrated!"
+
+    mysql -e "set password for ${mysqlUser}@localhost = password('${mysqlPass}');"
+    mysql -u${mysqlUser} -p${mysqlPass} -e "GRANT ALL PRIVILEGES ON *.* TO '${mysqlUser}'@'%' IDENTIFIED BY '${mysqlPass}';"
+    mysql -u${mysqlUser} -p${mysqlPass} -e "flush privileges;"
+    LOG -info -s "mysql user: [${mysqlUser}] password:[${mysqlPass}]"
+
+    service mysql restart
+    LOG -info -s "service mysql restarted"
+    LOG -info -s "========= mysql installed ========="
+}
+
+# @use: installRabbitmqctl
+function installRabbitmqctl() {
+    local rabbitmqUser=$(getConf ${CONF_PATH} rabbitmq user)
+    local rabbitmqPass=$(getConf ${CONF_PATH} rabbitmq password)
+    packagesInstall "rabbitmq-server"
+    rabbitmqctl add_user ${rabbitmqUser} ${rabbitmqPass} && LOG -info -s "rabbitmqctl set permissions for ${rabbitmqUser}"
+    rabbitmqctl set_permissions ${rabbitmqUser} "." "." ".*" && LOG -info -s "rabbitmqctl add user:${rabbitmqUser} password:${rabbitmqPass}"
+    LOG -info -s "========= Rabbitmq service installed ========="
+}
+
+# @use: installOpenStackClient
+function installOpenStackClient() {
+    LOG -info -s "adding rocky repository"
+    add-apt-repository cloud-archive:rocky # >>${LOG_PATH} 2>&1
+    packagesInstall "python-openstackclient"
+}
+
+# @use: installMemcache
+function installMemcache() {
+    packagesInstall "memcached" "python-memcache"
+
+    local memcachedConfPath="/etc/memcached.conf"
+    local keystoneHostIp=$(getConf ${CONF_PATH} keystone host_ip)
+    sed -i -e "s/\\-l\\s*[0-9\\.]*/-l ${keystoneHostIp}/g" ${memcachedConfPath}
+    LOG -info -s "${memcachedConfPath} has been modified"
+    service memcached restart && LOG -info -s "service memcached restart"
+    LOG -info -s "========= Memcache installed ========="
+}
+
+# @use: installEtcd
+function installEtcd() {
+    packagesInstall "etcd"
+
+    local etcdConfPath="/etc/default/etcd"
+    local etcdName=$(getConf ${CONF_PATH} etcd etcd_name)
+    local etcdHostIp=$(getConf ${CONF_PATH} etcd host_ip)
+
+    echo "ETCD_NAME=\"${etcdName}\"" >${etcdConfPath}
+    echo "ETCD_DATA_DIR=\"/var/lib/etcd\"" >>${etcdConfPath}
+    echo "ETCD_INITIAL_CLUSTER_STATE=\"new\"" >>${etcdConfPath}
+    echo "ETCD_INITIAL_CLUSTER_TOKEN=\"etcd-cluster-01\"" >>${etcdConfPath}
+    echo "ETCD_INITIAL_CLUSTER=\"controller=http://${etcdHostIp}:2380\"" >>${etcdConfPath}
+    echo "ETCD_INITIAL_ADVERTISE_PEER_URLS=\"http://${etcdHostIp}:2380\"" >>${etcdConfPath}
+    echo "ETCD_ADVERTISE_CLIENT_URLS=\"http://${etcdHostIp}:2379\"" >>${etcdConfPath}
+    echo "ETCD_LISTEN_PEER_URLS=\"http://0.0.0.0:2380\"" >>${etcdConfPath}
+    echo "ETCD_LISTEN_CLIENT_URLS=\"http://${etcdHostIp}:2379\"" >>${etcdConfPath}
+    LOG -info -s "${etcdConfPath} has been modified"
+    systemctl enable etcd && LOG -info -s "systemctl enable etcd"
+    systemctl start etcd && LOG -info -s "systemctl start etcd" 
+    LOG -info -s "========= ETCD installed ========="
+}
+
+# @use: installKeystone
+# @ref-url: https://docs.openstack.org/keystone/rocky/install/index-ubuntu.html
+function installKeystone() {
+    # Create database for {keystone} and grant privilegs to keystone user
+    #excuteSQL "CREATE DATABASE ${KEYSTONE_DATABASE};"
+    #excuteSQL "GRANT ALL PRIVILEGES ON ${KEYSTONE_DATABASE}.* TO '${KEYSTONE_USER}'@'localhost' IDENTIFIED BY '${KEYSTONE_PASS}';"
+    #excuteSQL "GRANT ALL PRIVILEGES ON ${KEYSTONE_DATABASE}.* TO '${KEYSTONE_USER}'@'%' IDENTIFIED BY '${KEYSTONE_PASS}';"
+
+    local keystoneUser=$(getConf ${CONF_PATH} keystone user)
+    local keystonePass=$(getConf ${CONF_PATH} keystone password)
+    local keystoneDatabase=$(getConf ${CONF_PATH} keystone database)
+    local keystoneHostIp=$(getConf ${CONF_PATH} keystone host_ip)
+    local mysqlUser=$(getConf ${CONF_PATH} mysql user)
+    local mysqlPass=$(getConf ${CONF_PATH} mysql password)
+    local mysqlHostIp=$(getConf ${CONF_PATH} mysql host_ip)
+    local mysqlHost=$(getConf ${CONF_PATH} mysql host)
+    local rabbitmqUser=$(getConf ${CONF_PATH} rabbitmq user)
+    local rabbitmqPass=$(getConf ${CONF_PATH} rabbitmq password)
+
+    local projectDomainName=$(getConf ${CONF_PATH} domain project_domain_name)
+    local projectName=$(getConf ${CONF_PATH} domain project_name)
+    local regionName=$(getConf ${CONF_PATH} domain region_name)
+
+    excuteSQL "DROP DATABASE IF EXISTS ${keystoneDatabase};"
+    excuteSQL "CREATE DATABASE IF NOT EXISTS ${keystoneDatabase};"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${keystoneDatabase}.* TO '${keystoneUser}'@'localhost' IDENTIFIED BY '${keystonePass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${keystoneDatabase}.* TO '${keystoneUser}'@'%' IDENTIFIED BY '${keystonePass}';"
+    LOG -info -s "{keystone} database has been created!"
+
+    packagesInstall "keystone" "apache2" "libapache2-mod-wsgi"
+    sed --version >>/dev/null 2>&1 || (LOG -info -s "sed command not found!" && exit 1)
+
+    # Modify configuration of {keystone}
+    local keystoneConfPath='/etc/keystone/keystone.conf'
+    setConf ${keystoneConfPath} database connection "mysql+pymysql://${keystoneUser}:${keystonePass}@${mysqlHostIp}/${keystoneDatabase}"
+    setConf ${keystoneConfPath} DEFAULT log_dir "/var/log/keystone"
+    setConf ${keystoneConfPath} token provider fernet
+    LOG -info -s "{keystone} has been configrated!"
+
+    # Populated the Identity service database
+    su -s /bin/sh -c "keystone-manage db_sync" ${keystoneUser} # >>${LOG_PATH} 2>&1
+    LOG -info -s "Populated the Identity service database"
+
+    # Initialized Fernet key repositories
+    keystone-manage fernet_setup --keystone-user ${keystoneUser} --keystone-group keystone # >>${LOG_PATH} 2>&1
+    LOG -info -s "keystone-manage fernet_setup --keystone-user ${keystoneUser} --keystone-group keystone"
+    
+    keystone-manage credential_setup --keystone-user ${keystoneUser} --keystone-group keystone # >>${LOG_PATH} 2>&1
+    LOG -info -s "keystone-manage credential_setup --keystone-user ${keystoneUser} --keystone-group keystone"
+
+    # bootstrapped the Identity service
+    keystone-manage bootstrap --bootstrap-password admin --bootstrap-admin-url http://${keystoneHostIp}:5000/v3/ --bootstrap-internal-url http://${keystoneHostIp}:5000/v3/ --bootstrap-public-url http://${keystoneHostIp}:5000/v3/ --bootstrap-region-id ${regionName} # >>${LOG_PATH} 2>&1
+    LOG -info -s "keystone-manage bootstrap --bootstrap-password admin --bootstrap-admin-url http://${keystoneHostIp}:5000/v3/ --bootstrap-internal-url http://${keystoneHostIp}:5000/v3/ --bootstrap-public-url http://${keystoneHostIp}:5000/v3/ --bootstrap-region-id ${regionName}"
+    
+    LOG -info -s "bootstrapped the Identity service"
+
+    
+    sed -i -e '/^\s*ServerName.*/d' /etc/apache2/apache2.conf
+    echo "ServerName ${mysqlHost}" >>/etc/apache2/apache2.conf
+    LOG -info -s "ServerName ${mysqlHost}"
+
+    service apache2 restart
+    LOG -info -s "service apache2 restart"
+
+    openstack project create --domain ${projectDomainName} --description "Service Project" ${projectName} # >>${LOG_PATH} 2>&1
+    LOG -info -s "openstack project create --domain ${projectDomainName} --description "Service Project" ${projectName}"
+    openstack role create user # >>${LOG_PATH} 2>&1
+    LOG -info -s "openstack role create user"
+    openstack token issue
+    LOG -info -s "openstack token issue"
+    LOG -info -s "========= keystone service installed ========="
+}
+
+# @use: installGlance
+function installGlance() {
+    local glanceUser=$(getConf ${CONF_PATH} glance user)
+    local glancePass=$(getConf ${CONF_PATH} glance password)
+    local glanceDatabase=$(getConf ${CONF_PATH} glance database)
+    local glanceHostIp=$(getConf ${CONF_PATH} glance host_ip)
+    local keystoneHostIp=$(getConf ${CONF_PATH} keystone host_ip)
+    local mysqlHostIp=$(getConf ${CONF_PATH} mysql host_ip)
+    local projectDomainName=$(getConf ${CONF_PATH} domain project_domain_name)
+    local userDomainName=$(getConf ${CONF_PATH} domain user_domain_name)
+    local projectName=$(getConf ${CONF_PATH} domain project_name)
+    local regionName=$(getConf ${CONF_PATH} domain region_name)
+
+    excuteSQL "DROP DATABASE IF EXISTS ${glanceDatabase};"
+    excuteSQL "CREATE DATABASE IF NOT EXISTS ${glanceDatabase};"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${glanceDatabase}.* TO '${glanceUser}'@'localhost' IDENTIFIED BY '${glancePass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${glanceDatabase}.* TO '${glanceUser}'@'%' IDENTIFIED BY '${glancePass}';"
+
+    if (( `openstack user list | grep ${glanceUser} | wc -l` > 0 )); then 
+        openstack user delete ${glanceUser}
+        LOG -info -s "openstack user delete ${glanceUser}"
+    fi
+
+    if (( `openstack service list | grep glance | wc -l` > 0 )); then 
+        openstack service delete glance
+        LOG -info -s "openstack service delete glance"
+    fi
+
+    openstack user create --domain ${userDomainName} --password ${glancePass} ${glanceUser} # >>${LOG_PATH} 2>&1
+    openstack role add --project ${projectName} --user ${glanceUser} admin # >>${LOG_PATH} 2>&1
+    openstack service create --name glance --description "OpenStack Image" image # >>${LOG_PATH} 2>&1
+    openstack endpoint create --region ${regionName} image public http://${glanceHostIp}:9292 # >>${LOG_PATH} 2>&1
+    openstack endpoint create --region ${regionName} image internal http://${glanceHostIp}:9292 # >>${LOG_PATH} 2>&1
+    openstack endpoint create --region ${regionName} image admin http://${glanceHostIp}:9292 # >>${LOG_PATH} 2>&1
+    LOG -info -s "add or create [endpoint, service, role, user]"
+
+    packagesInstall "glance"
+
+    local glanceApiConfPath="/etc/glance/glance-api.conf"
+    setConf ${glanceApiConfPath} database connection mysql+pymysql://${glanceUser}:${glancePass}@${mysqlHostIp}/${glanceDatabase}
+    setConf ${glanceApiConfPath} keystone_authtoken www_authenticate_uri http://${keystoneHostIp}:5000
+    setConf ${glanceApiConfPath} keystone_authtoken auth_url http://${keystoneHostIp}:5000
+    setConf ${glanceApiConfPath} keystone_authtoken memcached_servers ${keystoneHostIp}:11211
+    setConf ${glanceApiConfPath} keystone_authtoken auth_type password
+    setConf ${glanceApiConfPath} keystone_authtoken project_domain_name ${projectDomainName}
+    setConf ${glanceApiConfPath} keystone_authtoken user_domain_name ${userDomainName}
+    setConf ${glanceApiConfPath} keystone_authtoken project_name ${projectName}
+    setConf ${glanceApiConfPath} keystone_authtoken username ${glanceUser}
+    setConf ${glanceApiConfPath} keystone_authtoken password ${glancePass}
+    setConf ${glanceApiConfPath} paste_deploy flavor keystone
+    setConf ${glanceApiConfPath} glance_store stores file,http
+    setConf ${glanceApiConfPath} glance_store default_store file
+    setConf ${glanceApiConfPath} glance_store filesystem_store_datadir /var/lib/glance/images/
+    LOG -info -s "${glanceApiConfPath} has been configrated"
+
+    local glanceRegistryConfPath="glance-registry.conf"
+    setConf ${glanceRegistryConfPath} database connection mysql+pymysql://${glanceUser}:${glancePass}@${mysqlHostIp}/${glanceDatabase}
+    setConf ${glanceRegistryConfPath} keystone_authtoken www_authenticate_uri http://${keystoneHostIp}:5000
+    setConf ${glanceRegistryConfPath} keystone_authtoken auth_url http://${keystoneHostIp}:5000
+    setConf ${glanceRegistryConfPath} keystone_authtoken memcached_servers ${keystoneHostIp}:11211
+    setConf ${glanceRegistryConfPath} keystone_authtoken auth_type password
+    setConf ${glanceRegistryConfPath} keystone_authtoken project_domain_name ${projectDomainName}
+    setConf ${glanceRegistryConfPath} keystone_authtoken user_domain_name ${userDomainName}
+    setConf ${glanceRegistryConfPath} keystone_authtoken project_name ${projectName}
+    setConf ${glanceRegistryConfPath} keystone_authtoken username ${glanceUser}
+    setConf ${glanceRegistryConfPath} keystone_authtoken password ${glancePass}
+    setConf ${glanceRegistryConfPath} paste_deploy flavor keystone
+    LOG -info -s "${glanceRegistryConfPath} has been configrated"
+
+    LOG -info -s "glance-manage db_syncing"
+    su -s /bin/sh -c "glance-manage db_sync" ${glanceUser} # >>${LOG_PATH} 2>&1
+    service glance-registry restart
+    LOG -info -s "service glance-registry restart"
+    service glance-api restart
+    LOG -info -s "service glance-api restart"
+
+
+    local doCreateImg=$(getConf ${CONF_PATH} glance create_cirros_img)
+    
+    if (( ${doCreateImg} == 'yes' )); then 
+        LOG -info -s "createing cirros image(${SRC_PATH}/img/cirros-0.4.0-x86_64-disk.img)"
+        openstack image create "cirros" --file ${SRC_PATH}/img/cirros-0.4.0-x86_64-disk.img --disk-format qcow2 --container-format bare --public # >>${LOG_PATH} 2>&1
+    fi
+
+    LOG -info -s "========= glance service installed ========="
+    # local count=$(ls cirros-0.4.0-x86_64-disk.img | wc -l)
+    # if (($count == 0)); then
+    #     LOG -info -s "downloading cirros.img"
+    #     wget http://download.cirros-cloud.net/0.4.0/cirros-0.4.0-x86_64-disk.img # >>${LOG_PATH} 2>&1
+    # fi
+}
+
+# @use: installNova_controller
+# @ref-url: https://docs.openstack.org/nova/rocky/install/controller-install-ubuntu.html
+function installNova_controller() {
+    local novaUser=$(getConf ${CONF_PATH} nova user)
+    local novaPass=$(getConf ${CONF_PATH} nova password)
+    local novaDatabase=$(getConf ${CONF_PATH} nova nova_database)
+    local novaApiDatabase=$(getConf ${CONF_PATH} nova nova_api_database)
+    local novaCell0Database=$(getConf ${CONF_PATH} nova nova_cell0_database)
+    local novaHostIp=$(getConf ${CONF_PATH} nova host_ip)
+
+    local placementUser=$(getConf ${CONF_PATH} placement user)
+    local placementPass=$(getConf ${CONF_PATH} placement password)
+    local placementDatabase=$(getConf ${CONF_PATH} placement database)
+    local placementHostIp=$(getConf ${CONF_PATH} placement host_ip)
+
+    local glanceHostIp=$(getConf ${CONF_PATH} glance host_ip)
+    local keystoneHostIp=$(getConf ${CONF_PATH} keystone host_ip)
+    local mysqlHostIp=$(getConf ${CONF_PATH} mysql host_ip)
+    local projectDomainName=$(getConf ${CONF_PATH} domain project_domain_name)
+    local userDomainName=$(getConf ${CONF_PATH} domain user_domain_name)
+    local projectName=$(getConf ${CONF_PATH} domain project_name)
+    local regionName=$(getConf ${CONF_PATH} domain region_name)
+
+    local rabbitmqUser=$(getConf ${CONF_PATH} rabbitmq user)
+    local rabbitmqPass=$(getConf ${CONF_PATH} rabbitmq password)
+    local rabbitmqHostIp=$(getConf ${CONF_PATH} rabbitmq host_ip)
+
+    excuteSQL "DROP DATABASE IF EXISTS ${novaDatabase};"
+    excuteSQL "DROP DATABASE IF EXISTS ${novaApiDatabase};"
+    excuteSQL "DROP DATABASE IF EXISTS ${novaCell0Database};"
+    excuteSQL "DROP DATABASE IF EXISTS ${placementDatabase};"
+    excuteSQL "CREATE DATABASE IF NOT EXISTS ${novaDatabase};"
+    excuteSQL "CREATE DATABASE IF NOT EXISTS ${novaApiDatabase};"
+    excuteSQL "CREATE DATABASE IF NOT EXISTS ${novaCell0Database};"
+    excuteSQL "CREATE DATABASE IF NOT EXISTS ${placementDatabase};"
+
+    excuteSQL "GRANT ALL PRIVILEGES ON ${novaDatabase}.* TO '${novaUser}'@'localhost' IDENTIFIED BY '${novaPass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${novaDatabase}.* TO '${novaUser}'@'%' IDENTIFIED BY '${novaPass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${novaApiDatabase}.* TO '${novaUser}'@'localhost' IDENTIFIED BY '${novaPass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${novaApiDatabase}.* TO '${novaUser}'@'%' IDENTIFIED BY '${novaPass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${novaCell0Database}.* TO '${novaUser}'@'localhost' IDENTIFIED BY '${novaPass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${novaCell0Database}.* TO '${novaUser}'@'%' IDENTIFIED BY '${novaPass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${placementDatabase}.* TO '${placementUser}'@'localhost' IDENTIFIED BY '${placementPass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${placementDatabase}.* TO '${placementUser}'@'%' IDENTIFIED BY '${placementPass}';"
+
+
+    if (( `openstack user list | grep ${novaUser} | wc -l` > 0 )); then 
+        openstack user delete ${novaUser}
+        LOG -info -s "openstack user delete ${novaUser}"
+    fi
+
+    if (( `openstack user list | grep ${placementUser} | wc -l` > 0 )); then 
+        openstack user delete ${placementUser}
+        LOG -info -s "openstack user delete ${placementUser}"
+    fi
+
+    if (( `openstack service list | grep nova | wc -l` > 0 )); then 
+        openstack service delete nova
+        LOG -info -s "openstack service delete nova"
+    fi
+
+    if (( `openstack service list | grep placement | wc -l` > 0 )); then 
+        openstack service delete placement
+        LOG -info -s "openstack service delete placement"
+    fi
+
+    openstack user create --domain ${userDomainName} --password ${novaPass} ${novaUser} # >>${LOG_PATH} 2>&1
+    openstack user create --domain ${userDomainName} --password ${placementPass} ${placementUser}
+    openstack role add --project ${projectName} --user ${novaUser} admin # >>${LOG_PATH} 2>&1
+    openstack role add --project ${projectName} --user ${placementUser} admin # >>${LOG_PATH} 2>&1
+    LOG -info -s "add or create [role, user]"
+
+    LOG -info -s "openstack service create --name nova --description "OpenStack Compute" compute"
+    openstack service create --name nova --description "OpenStack Compute" compute # >>${LOG_PATH} 2>&1
+
+    LOG -info -s "openstack service create --name placement --description "Placement API" placement"
+    openstack service create --name placement --description "Placement API" placement # >>${LOG_PATH} 2>&1
+
+    LOG -info -s "openstack endpoint create --region ${regionName} compute public http://${novaHostIp}:8774/v2.1"
+    openstack endpoint create --region ${regionName} compute public http://${novaHostIp}:8774/v2.1 # >>${LOG_PATH} 2>&1
+
+    LOG -info -s "openstack endpoint create --region ${regionName} compute internal http://${novaHostIp}:8774/v2.1"
+    openstack endpoint create --region ${regionName} compute internal http://${novaHostIp}:8774/v2.1 # >>${LOG_PATH} 2>&1
+
+    LOG -info -s "openstack endpoint create --region ${regionName} compute admin http://${novaHostIp}:8774/v2.1"
+    openstack endpoint create --region ${regionName} compute admin http://${novaHostIp}:8774/v2.1 # >>${LOG_PATH} 2>&1
+
+    LOG -info -s "openstack endpoint create --region ${regionName} placement public http://${placementHostIp}:8778"
+    openstack endpoint create --region ${regionName} placement public http://${placementHostIp}:8778 # >>${LOG_PATH} 2>&1
+
+    LOG -info -s "openstack endpoint create --region ${regionName} placement internal http://${placementHostIp}:8778"
+    openstack endpoint create --region ${regionName} placement internal http://${placementHostIp}:8778 # >>${LOG_PATH} 2>&1
+
+    LOG -info -s "openstack endpoint create --region ${regionName} placement admin http://${placementHostIp}:8778"
+    openstack endpoint create --region ${regionName} placement admin http://${placementHostIp}:8778 # >>${LOG_PATH} 2>&1    
+    LOG -info -s "add or create  [service, endpoint]"
+
+    packagesInstall "nova-api" "nova-conductor" "nova-consoleauth" "nova-novncproxy" "nova-scheduler" "nova-placement-api"
+
+    local novaConfPath="/etc/nova/nova.conf"
+    setConf ${novaConfPath} api_database connection mysql+pymysql://${novaUser}:${novaPass}@${mysqlHostIp}/nova_api
+    setConf ${novaConfPath} database connection mysql+pymysql://${novaUser}:${novaPass}@${mysqlHostIp}/nova
+    setConf ${novaConfPath} placement_database connection mysql+pymysql://${placementUser}:${placementPass}@${mysqlHostIp}/placement
+    delConf ${novaConfPath} DEFAULT log_dir
+    setConf ${novaConfPath} DEFAULT transport_url rabbit://${rabbitmqUser}:${rabbitmqPass}@${rabbitmqHostIp}
+    setConf ${novaConfPath} DEFAULT my_ip ${LOCAL_IPv4}
+    setConf ${novaConfPath} DEFAULT use_neutron true
+    setConf ${novaConfPath} DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
+    setConf ${novaConfPath} api auth_strategy keystone
+    setConf ${novaConfPath} keystone_authtoken auth_url http://${keystoneHostIp}:5000/v3
+    setConf ${novaConfPath} keystone_authtoken memcached_servers ${keystoneHostIp}:11211
+    setConf ${novaConfPath} keystone_authtoken auth_type password
+    setConf ${novaConfPath} keystone_authtoken project_domain_name ${projectDomainName}
+    setConf ${novaConfPath} keystone_authtoken user_domain_name ${userDomainName}
+    setConf ${novaConfPath} keystone_authtoken project_name ${projectName}
+    setConf ${novaConfPath} keystone_authtoken username ${novaUser}
+    setConf ${novaConfPath} keystone_authtoken password ${novaPass}
+    setConf ${novaConfPath} vnc enabled true
+    setConf ${novaConfPath} vnc server_listen '$my_ip'
+    setConf ${novaConfPath} vnc server_proxyclient_address '$my_ip'
+    setConf ${novaConfPath} glance api_servers http://${glanceHostIp}:9292
+    setConf ${novaConfPath} oslo_concurrency lock_path /var/lib/nova/tmp
+    delConf ${novaConfPath} placement
+    setConf ${novaConfPath} placement project_domain_name ${projectDomainName}
+    setConf ${novaConfPath} placement user_domain_name ${userDomainName}
+    setConf ${novaConfPath} placement project_name ${projectName}
+    setConf ${novaConfPath} placement region_name ${regionName}
+    setConf ${novaConfPath} placement auth_type password
+    setConf ${novaConfPath} placement auth_url http://${placementHostIp}:5000/v3
+    setConf ${novaConfPath} placement username ${placementUser}
+    setConf ${novaConfPath} placement password ${placementPass}
+    LOG -info -s "${novaConfPath} has been configrated"
+
+    LOG -info -s "nova-manage db sync"
+    su -s /bin/sh -c "nova-manage api_db sync" ${novaUser} # >>${LOG_PATH} 2>&1
+    su -s /bin/sh -c "nova-manage cell_v2 map_cell0" ${novaUser} # >>${LOG_PATH} 2>&1
+    su -s /bin/sh -c "nova-manage cell_v2 create_cell --name=cell1 --verbose" ${novaUser} # >>${LOG_PATH} 2>&1
+    su -s /bin/sh -c "nova-manage db sync" ${novaUser} # >>${LOG_PATH} 2>&1
+    # su -s /bin/sh -c "nova-manage cell_v2 list_cells" nova
+
+    service nova-api restart  && LOG -info -s "service nova-api restart "
+    service nova-consoleauth restart && LOG -info -s "service nova-consoleauth restart"
+    service nova-scheduler restart && LOG -info -s "service nova-scheduler restart"
+    service nova-conductor restart && LOG -info -s "service nova-conductor restart"
+    service nova-novncproxy restart && LOG -info -s "service nova-novncproxy restart"
+
+    LOG -info -s "========= nova service installed ========="
+}
+
+# @use: installNova_compute
+# @ref-url: https://docs.openstack.org/nova/rocky/install/compute-install-ubuntu.html
+function installNova_compute() {
+    local novaUser=$(getConf ${CONF_PATH} nova user)
+    local novaPass=$(getConf ${CONF_PATH} nova password)
+    local novaHostIp=$(getConf ${CONF_PATH} nova host_ip)
+    local placementUser=$(getConf ${CONF_PATH} placement user)
+    local placementPass=$(getConf ${CONF_PATH} placement password)
+    local placementDatabase=$(getConf ${CONF_PATH} placement database)
+    local placementHostIp=$(getConf ${CONF_PATH} placement host_ip)
+    local glanceHostIp=$(getConf ${CONF_PATH} glance host_ip)
+    local keystoneHostIp=$(getConf ${CONF_PATH} keystone host_ip)
+    local mysqlHostIp=$(getConf ${CONF_PATH} mysql host_ip)
+    local projectDomainName=$(getConf ${CONF_PATH} domain project_domain_name)
+    local userDomainName=$(getConf ${CONF_PATH} domain user_domain_name)
+    local projectName=$(getConf ${CONF_PATH} domain project_name)
+    local regionName=$(getConf ${CONF_PATH} domain region_name)
+    local rabbitmqUser=$(getConf ${CONF_PATH} rabbitmq user)
+    local rabbitmqPass=$(getConf ${CONF_PATH} rabbitmq password)
+    local rabbitmqHostIp=$(getConf ${CONF_PATH} rabbitmq host_ip)
+
+    packagesInstall "nova-compute"
+
+    local novaConfPath="/etc/nova/nova.conf"
+    delConf ${novaConfPath} DEFAULT log_dir
+    setConf ${novaConfPath} DEFAULT transport_url rabbit://${rabbitmqUser}:${rabbitmqPass}@${rabbitmqHostIp}
+    setConf ${novaConfPath} DEFAULT my_ip ${LOCAL_IPv4}
+    setConf ${novaConfPath} DEFAULT use_neutron true
+    setConf ${novaConfPath} DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
+    setConf ${novaConfPath} api auth_strategy keystone
+    setConf ${novaConfPath} keystone_authtoken auth_url http://${keystoneHostIp}:5000/v3
+    setConf ${novaConfPath} keystone_authtoken memcached_servers ${keystoneHostIp}:11211
+    setConf ${novaConfPath} keystone_authtoken auth_type password
+    setConf ${novaConfPath} keystone_authtoken project_domain_name ${projectDomainName}
+    setConf ${novaConfPath} keystone_authtoken user_domain_name ${userDomainName}
+    setConf ${novaConfPath} keystone_authtoken project_name ${projectName}
+    setConf ${novaConfPath} keystone_authtoken username ${novaUser}
+    setConf ${novaConfPath} keystone_authtoken password ${novaPass}
+    setConf ${novaConfPath} vnc enabled true
+    setConf ${novaConfPath} vnc server_listen 0.0.0.0
+    setConf ${novaConfPath} vnc server_proxyclient_address '$my_ip'
+    setConf ${novaConfPath} vnc novncproxy_base_url http://${novaHostIp}:6080/vnc_auto.html
+    setConf ${novaConfPath} glance api_servers http://${glanceHostIp}:9292
+    setConf ${novaConfPath} oslo_concurrency lock_path /var/lib/nova/tmp
+    delConf ${novaConfPath} placement
+    setConf ${novaConfPath} placement project_domain_name ${projectDomainName}
+    setConf ${novaConfPath} placement user_domain_name ${userDomainName}
+    setConf ${novaConfPath} placement project_name ${projectName}
+    setConf ${novaConfPath} placement region_name ${regionName}
+    setConf ${novaConfPath} placement auth_type password
+    setConf ${novaConfPath} placement auth_url http://${placementHostIp}:5000/v3
+    setConf ${novaConfPath} placement username ${placementUser}
+    setConf ${novaConfPath} placement password ${placementPass}
+    LOG -info -s "${novaConfPath}  has been configrated"
+
+    local cpuinfo=$(egrep -c '(vmx|svm)' /proc/cpuinfo)
+    if ((${cpuinfo} == 0)); then
+        setConf /etc/nova/nova-compute.conf libvirt virt_type qemu
+        LOG -info -s "/etc/nova/nova-compute.conf has been configrated"
+    fi
+
+    service nova-compute restart && LOG -info -s "service nova-compute restart"
+    LOG -info -s "========= nova-compute installed ========="
+}
+
+# @use: installNeutron_controller
+# @ref-url: https://docs.openstack.org/neutron/rocky/install/controller-install-ubuntu.html
+function installNeutron_controller() {
+    local neutronUser=$(getConf ${CONF_PATH} neutron user)
+    local neutronPass=$(getConf ${CONF_PATH} neutron password)
+    local neutronDatabase=$(getConf ${CONF_PATH} neutron database)
+    local neutronHostIp=$(getConf ${CONF_PATH} neutron host_ip)
+    local novaUser=$(getConf ${CONF_PATH} nova user)
+    local novaPass=$(getConf ${CONF_PATH} nova password)
+    local novaHostIp=$(getConf ${CONF_PATH} nova host_ip)
+    local placementUser=$(getConf ${CONF_PATH} placement user)
+    local placementPass=$(getConf ${CONF_PATH} placement password)
+    local placementDatabase=$(getConf ${CONF_PATH} placement database)
+    local placementHostIp=$(getConf ${CONF_PATH} placement host_ip)
+    local keystoneHostIp=$(getConf ${CONF_PATH} keystone host_ip)
+    local mysqlHostIp=$(getConf ${CONF_PATH} mysql host_ip)
+    local projectDomainName=$(getConf ${CONF_PATH} domain project_domain_name)
+    local userDomainName=$(getConf ${CONF_PATH} domain user_domain_name)
+    local projectName=$(getConf ${CONF_PATH} domain project_name)
+    local regionName=$(getConf ${CONF_PATH} domain region_name)
+    local rabbitmqUser=$(getConf ${CONF_PATH} rabbitmq user)
+    local rabbitmqPass=$(getConf ${CONF_PATH} rabbitmq password)
+    local rabbitmqHostIp=$(getConf ${CONF_PATH} rabbitmq host_ip)
+
+    excuteSQL "DROP DATABASE IF EXISTS ${neutronDatabase};"
+    excuteSQL "CREATE DATABASE IF NOT EXISTS ${neutronDatabase};"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${neutronDatabase}.* TO '${neutronUser}'@'localhost' IDENTIFIED BY '${neutronPass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${neutronDatabase}.* TO '${neutronUser}'@'%' IDENTIFIED BY '${neutronPass}';"
+
+    if (( `openstack user list | grep ${neutronUser}  | wc -l` > 0 )); then 
+        openstack user delete ${neutronUser} 
+        LOG -info -s "openstack user delete ${neutronUser} "
+    fi
+
+    if (( `openstack service list | grep neutron | wc -l` > 0 )); then 
+        openstack service delete neutron
+        LOG -info -s "openstack service delete neutron"
+    fi
+    
+    LOG -info -s "openstack user create --domain ${userDomainName} --password ${neutronPass} ${neutronUser}"
+    openstack user create --domain ${userDomainName} --password ${neutronPass} ${neutronUser} # >>${LOG_PATH} 2>&1
+    
+    LOG -info -s "openstack role add --project ${projectName} --user ${neutronUser} admin"
+    openstack role add --project ${projectName} --user ${neutronUser} admin # >>${LOG_PATH} 2>&1
+    
+    LOG -info -s "openstack service create --name neutron --description "OpenStack Networking" network"
+    openstack service create --name neutron --description "OpenStack Networking" network # >>${LOG_PATH} 2>&1
+    
+    LOG -info -s "openstack endpoint create --region ${regionName} network public http://${neutronHostIp}:9696"
+    openstack endpoint create --region ${regionName} network public http://${neutronHostIp}:9696 # >>${LOG_PATH} 2>&1
+    
+    LOG -info -s "openstack endpoint create --region ${regionName} network internal http://${neutronHostIp}:9696"
+    openstack endpoint create --region ${regionName} network internal http://${neutronHostIp}:9696 # >>${LOG_PATH} 2>&1
+    
+    LOG -info -s "openstack endpoint create --region ${regionName} network admin http://${neutronHostIp}:9696"
+    openstack endpoint create --region ${regionName} network admin http://${neutronHostIp}:9696 # >>${LOG_PATH} 2>&1
+    LOG -info -s "add and create [user, role, service, endpoint]"
+
+    packagesInstall "neutron-server" "neutron-plugin-ml2" "neutron-openvswitch-agent" "neutron-l3-agent" "neutron-dhcp-agent" "neutron-metadata-agent"
+
+    ovs-vsctl del-br br-ext
+    LOG -info -s "ovs-vsctl del-br br-ext"
+    ovs-vsctl add-br br-ext
+    LOG -info -s "ovs-vsctl add-br br-ext"
+
+    local neutronConfPath="/etc/neutron/neutron.conf"
+    setConf ${neutronConfPath} database connection mysql+pymysql://${neutronUser}:${neutronPass}@${mysqlHostIp}/neutron
+    setConf ${neutronConfPath} DEFAULT core_plugin ml2
+    setConf ${neutronConfPath} DEFAULT service_plugins router
+    setConf ${neutronConfPath} DEFAULT allow_overlapping_ips true
+    setConf ${neutronConfPath} DEFAULT transport_url rabbit://${rabbitmqUser}:${rabbitmqPass}@${rabbitmqHostIp}
+    setConf ${neutronConfPath} DEFAULT auth_strategy keystone
+    setConf ${neutronConfPath} DEFAULT notify_nova_on_port_status_changes true
+    setConf ${neutronConfPath} DEFAULT notify_nova_on_port_data_changes true
+    setConf ${neutronConfPath} keystone_authtoken www_authenticate_uri http://${keystoneHostIp}:5000
+    setConf ${neutronConfPath} keystone_authtoken auth_url http://${keystoneHostIp}:5000
+    setConf ${neutronConfPath} keystone_authtoken memcached_servers ${keystoneHostIp}:11211
+    setConf ${neutronConfPath} keystone_authtoken auth_type password
+    setConf ${neutronConfPath} keystone_authtoken project_domain_name ${projectDomainName}
+    setConf ${neutronConfPath} keystone_authtoken user_domain_name ${userDomainName}
+    setConf ${neutronConfPath} keystone_authtoken project_name ${projectName}
+    setConf ${neutronConfPath} keystone_authtoken username ${neutronUser}
+    setConf ${neutronConfPath} keystone_authtoken password ${neutronPass}
+    setConf ${neutronConfPath} nova auth_url http://${novaHostIp}:5000
+    setConf ${neutronConfPath} nova auth_type password
+    setConf ${neutronConfPath} nova project_domain_name ${projectDomainName}
+    setConf ${neutronConfPath} nova user_domain_name ${userDomainName}
+    setConf ${neutronConfPath} nova project_name ${projectName}
+    setConf ${neutronConfPath} nova region_name ${regionName}
+    setConf ${neutronConfPath} nova username ${novaUser}
+    setConf ${neutronConfPath} nova password ${novaPass}
+    setConf ${neutronConfPath} oslo_concurrency lock_path /var/lib/neutron/tmp
+
+    LOG -info -s "${neutronConfPath} setted!"
+
+    local novaConfPath="/etc/nova/nova.conf"
+    setConf ${novaConfPath} neutron url http://${neutronHostIp}:9696
+    setConf ${novaConfPath} neutron auth_url http://${neutronHostIp}:5000
+    setConf ${novaConfPath} neutron auth_type password
+    setConf ${novaConfPath} neutron project_domain_name ${projectDomainName}
+    setConf ${novaConfPath} neutron user_domain_name ${userDomainName}
+    setConf ${novaConfPath} neutron project_name ${projectName}
+    setConf ${novaConfPath} neutron region_name ${regionName}
+    setConf ${novaConfPath} neutron username ${neutronUser}
+    setConf ${novaConfPath} neutron password ${neutronPass}
+    setConf ${novaConfPath} neutron service_metadata_proxy true
+    setConf ${novaConfPath} neutron metadata_proxy_shared_secret metadata
+
+    LOG -info -s "${novaConfPath} setted!"
+
+    local ml2ConfIniPath="/etc/neutron/plugins/ml2/ml2_conf.ini"
+    setConf ${ml2ConfIniPath} ml2 type_drivers flat,vlan,vxlan
+    setConf ${ml2ConfIniPath} ml2 tenant_network_types vxlan
+    setConf ${ml2ConfIniPath} ml2 mechanism_drivers openvswitch,l2population
+    setConf ${ml2ConfIniPath} ml2 extension_drivers port_security
+    setConf ${ml2ConfIniPath} ml2_type_flat flat_networks provider
+    setConf ${ml2ConfIniPath} ml2_type_vxlan vni_ranges 10001:20000
+    setConf ${ml2ConfIniPath} securitygroup enable_ipset true
+
+    LOG -info -s "${ml2ConfIniPath} setted!"
+
+    local openvswitchAgentIniPath="/etc/neutron/plugins/ml2/openvswitch_agent.ini"
+    setConf ${openvswitchAgentIniPath} ovs bridge_mappings provider:br-ext
+    setConf ${openvswitchAgentIniPath} ovs local_ip ${LOCAL_IPv4}
+    setConf ${openvswitchAgentIniPath} agent tunnel_types vxlan
+    setConf ${openvswitchAgentIniPath} agent l2_population True
+    setConf ${openvswitchAgentIniPath} securitygroup firewall_driver iptables_hybrid
+
+    LOG -info -s "${openvswitchAgentIniPath} setted!"
+
+    local l3AgentIniPath="/etc/neutron/l3_agent.ini"
+    setConf ${l3AgentIniPath} DEFAULT interface_driver openvswitch
+    setConf ${l3AgentIniPath} DEFAULT external_network_bridge
+
+    LOG -info -s "${l3AgentIniPath} setted!"
+
+    local dhcpAgentIniPath="/etc/neutron/dhcp_agent.ini"
+    setConf ${dhcpAgentIniPath} DEFAULT interface_driver openvswitch
+    setConf ${dhcpAgentIniPath} DEFAULT dhcp_driver neutron.agent.linux.dhcp.Dnsmasq
+    setConf ${dhcpAgentIniPath} DEFAULT enable_isolated_metadata true
+
+    LOG -info -s "${dhcpAgentIniPath} setted!"
+
+    local metadataAgentIniPath="/etc/neutron/metadata_agent.ini"
+    setConf ${metadataAgentIniPath} DEFAULT nova_metadata_host controller
+    setConf ${metadataAgentIniPath} DEFAULT metadata_proxy_shared_secret metadata
+
+    LOG -info -s "${metadataAgentIniPath} setted!"
+
+    su -s /bin/sh -c "neutron-db-manage --config-file ${neutronConfPath} --config-file ${ml2ConfIniPath} upgrade head" ${neutronUser} # >>${LOG_PATH} 2>&1
+    LOG -info -s "neutron-db-manage upgrade head"
+
+    service nova-api restart && LOG -info -s "service nova-api restart"
+    service neutron-server restart && LOG -info -s "service neutron-server"
+    service neutron-openvswitch-agent restart && LOG -info -s "service neutron-openvswitch-agent restart"
+    service neutron-dhcp-agent restart && LOG -info -s "service neutron-dhcp-agent restart"
+    service neutron-metadata-agent restart && LOG -info -s "service neutron-metadata-agent restart"
+    service neutron-l3-agent restart && LOG -info -s "service neutron-l3-agent restart"
+    LOG -info -s "========= neutron service installed ========="
+}
+
+# @use: installNeutron_compute
+# @ref-url: https://docs.openstack.org/neutron/rocky/install/compute-install-ubuntu.html
+function installNeutron_compute() {
+    local neutronUser=$(getConf ${CONF_PATH} neutron user)
+    local neutronPass=$(getConf ${CONF_PATH} neutron password)
+    local neutronDatabase=$(getConf ${CONF_PATH} neutron database)
+    local neutronHostIp=$(getConf ${CONF_PATH} neutron host_ip)
+    local novaUser=$(getConf ${CONF_PATH} nova user)
+    local novaPass=$(getConf ${CONF_PATH} nova password)
+    local novaHostIp=$(getConf ${CONF_PATH} nova host_ip)
+    local placementUser=$(getConf ${CONF_PATH} placement user)
+    local placementPass=$(getConf ${CONF_PATH} placement password)
+    local placementDatabase=$(getConf ${CONF_PATH} placement database)
+    local placementHostIp=$(getConf ${CONF_PATH} placement host_ip)
+    local keystoneHostIp=$(getConf ${CONF_PATH} keystone host_ip)
+    local mysqlHostIp=$(getConf ${CONF_PATH} mysql host_ip)
+    local projectDomainName=$(getConf ${CONF_PATH} domain project_domain_name)
+    local userDomainName=$(getConf ${CONF_PATH} domain user_domain_name)
+    local projectName=$(getConf ${CONF_PATH} domain project_name)
+    local regionName=$(getConf ${CONF_PATH} domain region_name)
+    local rabbitmqUser=$(getConf ${CONF_PATH} rabbitmq user)
+    local rabbitmqPass=$(getConf ${CONF_PATH} rabbitmq password)
+    local rabbitmqHostIp=$(getConf ${CONF_PATH} rabbitmq host_ip)
+
+    packagesInstall "neutron-openvswitch-agent"
+
+    LOG -info -s " mysqlHostIp :  ${mysqlHostIp}"
+    LOG -info -s " LOCAL_IPv4  :  ${LOCAL_IPv4}"
+
+    local neutronConfPath="/etc/neutron/neutron.conf"
+    if [ ${mysqlHostIp} == ${LOCAL_IPv4} ]; then
+        delConf ${neutronConfPath} database connection
+    fi
+    setConf ${neutronConfPath} DEFAULT transport_url rabbit://${rabbitmqUser}:${rabbitmqPass}@${rabbitmqHostIp}
+    setConf ${neutronConfPath} DEFAULT auth_strategy keystone
+    setConf ${neutronConfPath} keystone_authtoken www_authenticate_uri http://${keystoneHostIp}:5000
+    setConf ${neutronConfPath} keystone_authtoken auth_url http://${keystoneHostIp}:5000
+    setConf ${neutronConfPath} keystone_authtoken memcached_servers ${keystoneHostIp}:11211
+    setConf ${neutronConfPath} keystone_authtoken auth_type password
+    setConf ${neutronConfPath} keystone_authtoken project_domain_name ${projectDomainName}
+    setConf ${neutronConfPath} keystone_authtoken user_domain_name ${userDomainName}
+    setConf ${neutronConfPath} keystone_authtoken project_name ${projectName}
+    setConf ${neutronConfPath} keystone_authtoken username ${neutronUser}
+    setConf ${neutronConfPath} keystone_authtoken password ${neutronPass}
+    setConf ${neutronConfPath} oslo_concurrency lock_path /var/lib/neutron/tmp
+
+    LOG -info -s "${neutronConfPath} setted!"
+
+    local openvswitchAgentIniPath="/etc/neutron/plugins/ml2/openvswitch_agent.ini"
+    delConf ${openvswitchAgentIniPath} ovs bridge_mappings
+    setConf ${openvswitchAgentIniPath} ovs local_ip ${LOCAL_IPv4}
+    setConf ${openvswitchAgentIniPath} agent tunnel_types vxlan
+    setConf ${openvswitchAgentIniPath} agent l2_population True
+
+    LOG -info -s "${openvswitchAgentIniPath} setted!"
+
+    local novaConfPath="/etc/nova/nova.conf"
+    setConf ${novaConfPath} neutron url http://${novaHostIp}:9696
+    setConf ${novaConfPath} neutron auth_url http://${keystoneHostIp}:5000
+    setConf ${novaConfPath} neutron auth_type password
+    setConf ${novaConfPath} neutron project_domain_name ${projectDomainName}
+    setConf ${novaConfPath} neutron user_domain_name ${userDomainName}
+    setConf ${novaConfPath} neutron project_name ${projectName}
+    setConf ${novaConfPath} neutron region_name ${regionName}
+    setConf ${novaConfPath} neutron username ${neutronUser}
+    setConf ${novaConfPath} neutron password ${neutronPass}
+
+    LOG -info -s "${neutronDatabase} setted!"
+
+    service nova-compute restart && LOG -info -s "service nova-compute restart"
+    service neutron-openvswitch-agent restart && LOG -info -s "service neutron-openvswitch-agent restart"
+    LOG -info -s "========= neutron-openvswitch-agent installed ========="
+}
+
+# @use: installIronic
+# @ref-url: https://docs.openstack.org/ironic/rocky/install/install-ubuntu.html
+# @description: these components are configured to run on separate nodes or the same node, typically the Compute Service compute node
+function installIronic() {
+    local ironicUser=$(getConf ${CONF_PATH} ironic user)
+    local ironicPass=$(getConf ${CONF_PATH} ironic password)
+    local ironicDatabase=$(getConf ${CONF_PATH} ironic database)
+    local ironicHostIp=$(getConf ${CONF_PATH} ironic host_ip)
+
+    local neutronUser=$(getConf ${CONF_PATH} neutron user)
+    local neutronPass=$(getConf ${CONF_PATH} neutron password)
+    local neutronDatabase=$(getConf ${CONF_PATH} neutron database)
+    local neutronHostIp=$(getConf ${CONF_PATH} neutron host_ip)
+
+    local novaUser=$(getConf ${CONF_PATH} nova user)
+    local novaPass=$(getConf ${CONF_PATH} nova password)
+    local novaHostIp=$(getConf ${CONF_PATH} nova host_ip)
+
+    local keystoneHostIp=$(getConf ${CONF_PATH} keystone host_ip)
+    local mysqlHostIp=$(getConf ${CONF_PATH} mysql host_ip)
+    local projectDomainName=$(getConf ${CONF_PATH} domain project_domain_name)
+    local userDomainName=$(getConf ${CONF_PATH} domain user_domain_name)
+    local projectName=$(getConf ${CONF_PATH} domain project_name)
+    local regionName=$(getConf ${CONF_PATH} domain region_name)
+    local rabbitmqUser=$(getConf ${CONF_PATH} rabbitmq user)
+    local rabbitmqPass=$(getConf ${CONF_PATH} rabbitmq password)
+    local rabbitmqHostIp=$(getConf ${CONF_PATH} rabbitmq host_ip)
+
+    # Set up the database for Bare Metal
+    excuteSQL "DROP DATABASE IF EXISTS ${ironicDatabase};"
+    excuteSQL "CREATE DATABASE IF NOT EXISTS ${ironicDatabase} CHARACTER SET utf8"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${ironicDatabase}.* TO '${ironicUser}'@'localhost' IDENTIFIED BY '${ironicPass}';"
+    excuteSQL "GRANT ALL PRIVILEGES ON ${ironicDatabase}.* TO '${ironicUser}'@'%' IDENTIFIED BY '${ironicPass}';"
+
+    # Configure the Identity service for the Bare Metal service
+    # ref-url: https://docs.openstack.org/ironic/rocky/install/configure-identity.html
+
+    if (( `openstack service list | grep ironic | wc -l` > 0 )); then 
+        openstack service delete ironic
+    fi
+
+    openstack user create --domain ${userDomainName} --password ${ironicPass} ${ironicUser} # >>${LOG_PATH} 2>&1
+    openstack role add --project ${projectName} --user ${ironicUser} admin # >>${LOG_PATH} 2>&1
+    openstack service create --name ironic --description "Ironic baremetal provisioning service" baremetal # >>${LOG_PATH} 2>&1
+    openstack endpoint create --region ${regionName} baremetal admin http://${ironicHostIp}:6385 # >>${LOG_PATH} 2>&1
+    openstack endpoint create --region ${regionName} baremetal public http://${ironicHostIp}:6385 # >>${LOG_PATH} 2>&1
+    openstack endpoint create --region ${regionName} baremetal internal http://${ironicHostIp}:6385 # >>${LOG_PATH} 2>&1
+
+    # Install and configure components
+    packagesInstall "ironic-api" "ironic-conductor" "python-ironicclient"
+
+    # Configuring ironic-api service
+    local ironicConfPath=$(/etc/ironic/ironic.conf)
+    setConf ${ironicConfPath} database connection mysql+pymysql://${ironicUser}:${ironicPass}@${mysqlHostIp}/ironic?charset=utf8
+    setConf ${ironicConfPath} DEFAULT transport_url rabbit://${rabbitmqUser}:${rabbitmqPass}@${rabbitmqHostIp}
+    setConf ${ironicConfPath} keystone_authtoken www_authenticate_uri http://${keystoneHostIp}:5000
+    setConf ${ironicConfPath} keystone_authtoken auth_url http://${keystoneHostIp}:5000
+    setConf ${ironicConfPath} keystone_authtoken auth_type password
+    setConf ${ironicConfPath} keystone_authtoken project_domain_name ${projectDomainName}
+    setConf ${ironicConfPath} keystone_authtoken user_domain_name ${userDomainName}
+    setConf ${ironicConfPath} keystone_authtoken project_name ${projectName}
+    setConf ${ironicConfPath} keystone_authtoken username ${ironicUser}
+    setConf ${ironicConfPath} keystone_authtoken password ${ironicPass}
+
+    # Create the Bare Metal service database tabless
+    ironic-dbsync --config-file /etc/ironic/ironic.conf create_schema
+
+    # Restart the ironic-api service
+    service ironic-api restart
+
+    cp etc/apache2/ironic /etc/apache2/sites-available/ironic.conf
+    a2ensite ironic
+    service apache2 reload
+}
+
+function installHorizon() {
+    packagesInstall "openstack-dashboard"
+    
+    local userDomainName=$(getConf ${CONF_PATH} domain user_domain_name)
+    local keystoneHostIp=$(getConf ${CONF_PATH} keystone host_ip)
+    local local_settings='/etc/openstack-dashboard/local_settings.py'
+    
+    sed -i -e "s/OPENSTACK_HOST\\s*=.*/OPENSTACK_HOST = \"${keystoneHostIp}\"/g" ${local_settings}
+    
+    sed -i -e "s/ALLOWED_HOSTS\\s*=.*/ALLOWED_HOSTS = \['\*'\]/g" ${local_settings}
+    
+    sed -i -e "/^SESSION_ENGINE\\s*=.*/d" ${local_settings}
+    sed -i -e "829a\SESSION_ENGINE = 'django.contrib.sessions.backends.cache'" ${local_settings}
+    
+    sed -i -e "s/'LOCATION'\\s*:.*/'LOCATION': '${keystoneHostIp}:11211',/g" ${local_settings}
+
+    sed -i -e "/^OPENSTACK_KEYSTONE_MULTIDOMAIN_SUPPORT\\s*=.*/d" ${local_settings}
+    sed -i -e "83a\OPENSTACK_KEYSTONE_MULTIDOMAIN_SUPPORT = True" ${local_settings}
+
+    sed -i -e "/^OPENSTACK_KEYSTONE_DEFAULT_DOMAIN\\s*=.*/d" ${local_settings}
+    sed -i -e "98a\OPENSTACK_KEYSTONE_DEFAULT_DOMAIN = \"${userDomainName}\"" ${local_settings}
+
+    sed -i -e "/^OPENSTACK_KEYSTONE_DEFAULT_ROLE\\s*=.*/d" ${local_settings}
+    sed -i -e "188a\OPENSTACK_KEYSTONE_DEFAULT_ROLE = 'user'" ${local_settings}
+
+    sed -i -e "/^TIME_ZONE\\s*=.*/d" ${local_settings}
+    sed -i -e "466a\TIME_ZONE = 'Asia/Shanghai'" ${local_settings}
+
+    sed -i -e "/^OPENSTACK_API_VERSIONS\\s*=/,/^\}$/d" ${local_settings}
+    sed -i -e "72a\OPENSTACK_API_VERSIONS = {" ${local_settings}
+    sed -i -e "73a\    'identity': 3," ${local_settings}
+    sed -i -e "74a\    'image': 2," ${local_settings}
+    sed -i -e "75a\    'volume': 2," ${local_settings}
+    sed -i -e "76a\}" ${local_settings}
+
+    LOG -info -s "${local_settings} has been modified!"
+
+    service apache2 reload
+    LOG -info -s 'service apache2 reload'
+    LOG -info -s "========= horizon installed ========="
+}
+
+# @use: integrateODL [controller | compute]
+# @description: integrate ODL node for controller nodes and compute nodes
+function integrateODL() {
+    LOG -info -s $(uname -r)
+
+    lsmod | grep conntrack
+
+    local odlHostIp=$(getConf ${CONF_PATH} odl host_ip)
+    local odlUser=$(getConf ${CONF_PATH} odl user)
+    local odlPass=$(getConf ${CONF_PATH} odl password)
+    local neutronDatabase=$(getConf ${CONF_PATH} neutron database)
+
+    LOG -info -s "----------------get stack.conf----------------"
+    LOG -info -s "odlHostIp:        ${odlHostIp}"
+    LOG -info -s "odlUser:          ${odlUser}"
+    LOG -info -s "odlPass:          ${odlPass}"
+    LOG -info -s "neutronDatabase:  ${neutronDatabase}"
+    LOG -info -s "local-IP:         ${LOCAL_IPv4}"
+    LOG -info -s "----------------------------------------------"
+
+    packagesInstall "python-pip"
+    local ml2ConfIniPath="/etc/neutron/plugins/ml2/ml2_conf.ini"
+    local neutronConfPath="/etc/neutron/neutron.conf"
+    local dhcpAgentIniPath="/etc/neutron/dhcp_agent.ini"
+
+    if [ $1 == 'controller' ]; then
+        systemctl stop neutron-server
+        systemctl stop neutron-l3-agent
+        systemctl stop neutron-openvswitch-agent
+        systemctl disable neutron-l3-agent
+        systemctl disable neutron-openvswitch-agent
+        LOG -info -s "  stoped: neutron-l3-agent  neutron-openvswitch-agent  neutron-server"
+        LOG -info -s "disabled: neutron-l3-agent  neutron-openvswitch-agent"
+        #
+        setConf ${ml2ConfIniPath} ml2 mechanism_drivers opendaylight_v2
+        setConf ${ml2ConfIniPath} ml2 tenant_network_types vxlan
+        setConf ${ml2ConfIniPath} ml2 extension_drivers port_security
+        setConf ${ml2ConfIniPath} ml2_odl url http://${odlHostIp}:8181/controller/nb/v2/neutron
+        setConf ${ml2ConfIniPath} ml2_odl username ${odlUser}
+        setConf ${ml2ConfIniPath} ml2_odl password ${odlPass}
+        setConf ${neutronConfPath} DEFAULT service_plugins odl-router_v2
+        setConf ${dhcpAgentIniPath} DEFAULT force_metadata True
+        setConf ${dhcpAgentIniPath} DEFAULT ovs_integration_bridge br-int
+        setConf ${dhcpAgentIniPath} ovs ovsdb_interface vsctl
+        LOG -info -s "files[ml2_conf.ini , neutron.conf , dhcp_agent.ini] have been modified!"
+        #
+        excuteSQL "DROP DATABASE IF EXISTS ${neutronDatabase};"
+        excuteSQL "CREATE DATABASE IF NOT EXISTS ${neutronDatabase} CHARACTER SET utf8;"
+        LOG -info -s " droped:  [${neutronDatabase}] database"
+        LOG -info -s "created:  [${neutronDatabase}] database"
+        #
+        neutron-db-manage --config-file ${neutronConfPath} --config-file ${ml2ConfIniPath} upgrade head
+        systemctl start neutron-server
+        systemctl stop openvswitch-switch
+        LOG -info -s "started:   neutron-server"
+        LOG -info -s "stoped:    openvswitch-switch"
+        #
+        rm -rf /var/log/openvswitch/*
+        rm -rf /etc/openvswitch/conf.db
+        LOG -info -s "deleted:   [/var/log/openvswitch/*  ,  /etc/openvswitch/conf.db]"
+        #
+        systemctl start openvswitch-switch
+        LOG -info -s "started:   openvswitch-switch"
+        #
+        ovs-vsctl set-manager tcp:${odlHostIp}:6640
+        ovs-vsctl set Open_vSwitch . other_config:local_ip=${LOCAL_IPv4}
+        LOG -info -s "setted:    ovs set-manager tcp:${odlHostIp}:6640"
+        LOG -info -s "setted:    ovs Open_vSwitch . other_config:local_ip=${LOCAL_IPv4}"
+
+    elif [ $1 == 'compute' ]; then
+        systemctl stop neutron-openvswitch-agent
+        systemctl disable neutron-openvswitch-agent
+        systemctl stop openvswitch-switch
+        LOG -info -s "stoped: neutron-openvswitch-agent"
+        LOG -info -s "disabled: neutron-openvswitch-agent"
+        LOG -info -s "started: neutron-server"
+        #
+        rm -rf /var/log/openvswitch/*
+        rm -rf /etc/openvswitch/conf.db
+        LOG -info -s "deleted:   [/var/log/openvswitch/*  ,  /etc/openvswitch/conf.db]"
+        #
+        systemctl start openvswitch-switch
+        LOG -info -s "started:   openvswitch-switch"
+        #
+        ovs-vsctl set-manager tcp:${odlHostIp}:6640
+        ovs-vsctl set Open_vSwitch . other_config:local_ip=${LOCAL_IPv4}
+        LOG -info -s "setted:    ovs set-manager tcp:${odlHostIp}:6640"
+        LOG -info -s "setted:    ovs Open_vSwitch . other_config:local_ip=${LOCAL_IPv4}"
+
+        #ovs-vsctl set Open_vSwitch . other_config:provider_mappings=provier:ens224
+        #neutron-odl-ovs-hostconfig --datapath_type=system
+    else
+        LOG -error -s "too few arguments"
+    fi
+    LOG -info -s "========= changed ovs to odl ========="
+}
